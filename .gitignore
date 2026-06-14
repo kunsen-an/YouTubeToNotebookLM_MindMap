@@ -1,0 +1,11 @@
+# デバッグ書き出し（テスト成果物）
+youtube-to-notebooklm-debug-*.json
+
+# スクリーンショット等の一時画像
+*.png
+!icons/*.png
+
+# エディタ/ツール
+.claude/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>YouTube to NotebookLM</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="popup">
+      <!-- YouTube動画ページ以外で開いたとき -->
+      <section id="not-youtube" class="state state-muted" hidden>
+        <h1>YouTube動画ページで開いてください</h1>
+        <p>YouTube の動画ページ（/watch）を表示してから、もう一度アイコンをクリックしてください。</p>
+        <button id="download-debug-muted" class="secondary-button" type="button">デバッグ情報を保存</button>
+      </section>
+
+      <!-- 読み込み中 -->
+      <section id="loading" class="state state-muted">
+        <div class="spinner" aria-hidden="true"></div>
+        <p>動画情報を確認しています...</p>
+      </section>
+
+      <!-- 動画情報パネル -->
+      <section id="video-panel" hidden>
+        <img id="thumbnail" class="thumbnail" alt="" />
+        <div class="meta">
+          <h1 id="title"></h1>
+          <p id="channel"></p>
+        </div>
+
+        <p id="error" class="message error" hidden></p>
+
+        <button id="add-button" type="button">NotebookLMに追加</button>
+
+        <div class="progress-header" id="progress-header" hidden>
+          <span class="progress-title">進捗ログ</span>
+          <button id="clear-progress" class="link-button" type="button">消去</button>
+        </div>
+        <ol id="progress" class="progress" aria-live="polite"></ol>
+
+        <div class="debug-actions">
+          <button id="download-debug" class="secondary-button" type="button">
+            保存先を選んでデバッグ情報を保存
+          </button>
+          <button id="copy-debug" class="secondary-button quiet-button" type="button">コピー</button>
+        </div>
+        <p id="debug-status" class="copy-status" aria-live="polite"></p>
+      </section>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
