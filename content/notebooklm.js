@@ -115,12 +115,71 @@ async function runFlow(payload) {
 
   await prepareNotebook(channel, resolved);
 
-  await addYouTubeSource(video);
-  await selectOnlyVideoSource(video);
-  await startMindMap(video);
+  // 同じ動画が既にソースにあれば、新規追加せず既存（処理済み）コピーを再利用する。
+  // 毎回追加すると未処理コピーが増え、それだけを選択するとStudioが無効のままになるため。
+  // 新規作成ノートブックにはソースが無いので再利用判定はスキップする。
+  const reused = resolved?.action === "create" ? false : await reuseExistingVideoSourceIfPresent(video);
+  if (!reused) {
+    await addYouTubeSource(video);
+    await selectOnlyVideoSource(video);
+  }
+  const mindMap = await startMindMap(video);
 
-  status(`ノートブック「${currentContext.openedNotebook || channel}」でマインドマップの生成を開始しました`, "done");
-  return { notebook: currentContext.openedNotebook || channel };
+  const nb = currentContext.openedNotebook || channel;
+  if (mindMap?.skipped) {
+    status(`ノートブック「${nb}」には既にこの動画のマインドマップがあるため、生成しませんでした`, "done");
+  } else {
+    status(`ノートブック「${nb}」でマインドマップの生成を開始しました`, "done");
+  }
+  return { notebook: nb, skipped: Boolean(mindMap?.skipped) };
+}
+
+// 追加前のソース一覧に、同じ動画が既に存在すれば true（その既存ソースのみ選択する）。
+async function reuseExistingVideoSourceIfPresent(video) {
+  // ソース一覧の描画を少し待ってから判定する（既存ノートブックの読み込み直後対策）。
+  const rows = await waitFor(() => {
+    const panel = findSourcePanel();
+    const list = panel ? findSourceRows(panel) : [];
+    return list.length > 0 ? list : false;
+  }, 6000, "").catch(() => []);
+  if (!rows || rows.length === 0) return false;
+
+  const matches = matchVideoRows(rows, video);
+  if (matches.length === 0) return false;
+
+  status("この動画は既にノートブックのソースにあります。重複追加せず、既存ソースを再利用します");
+  await debug("reuse:found", { matches: matches.map((m) => m.title), total: rows.length });
+
+  // 既存コピーのみを選択する（処理済みなのでStudioは即有効になる）。
+  const cleared = await clearAllSelectionsViaMaster();
+  await debug("reuse:clear-all", { cleared });
+  if (cleared) status("いったん全ソースの選択を解除しました");
+
+  const matchSet = new Set(matches);
+  const report = await applyOnlyTargets(rows, (r) => matchSet.has(r));
+  await debug("reuse:select", { targets: matches.map((m) => m.title), report });
+
+  if (report.some((r) => r.want && r.status === "failed")) {
+    status("既存ソースの選択切り替えが一部反映されませんでした。全ソースが対象になる場合があります。", "info");
+  } else {
+    status(`マインドマップ対象を「${matches[0].title || "追加済みの動画"}」（既存ソース）に設定しました`);
+  }
+  return true;
+}
+
+// ソース行の中から、対象動画に一致するもの（videoID／URL／タイトル一致）を返す。
+function matchVideoRows(rows, video) {
+  const videoId = safeVideoId(video.url).toLowerCase();
+  const url = normalize(video.url);
+  const title = normalize(video.title || "");
+  return rows.filter((r) => {
+    const t = normalize(r.title);
+    if (videoId && r.text.includes(videoId)) return true;
+    if (url && url.length > 0 && r.text.includes(url)) return true;
+    // タイトル一致（NotebookLMの行タイトルは短縮される場合があるため双方向 includes、短文の誤検出は除外）。
+    if (title.length >= 8 && t.length >= 8 && (t === title || title.includes(t) || t.includes(title))) return true;
+    return false;
+  });
 }
 
 // ===========================================================================
@@ -771,35 +830,13 @@ async function selectOnlyVideoSource(video) {
     return;
   }
 
-  const videoId = safeVideoId(video.url);
-  const titleHint = normalize((video.title || "").slice(0, 24));
-  const url = normalize(video.url);
-  const before = currentContext.sourceTitlesBefore || [];
-
-  // 対象 = 追加前の在庫を超えて増えた行（＝今回新規に追加された動画）。
-  // 多重集合の差分で判定するため、同名の動画が既に存在していても新規分だけを正しく選べる。
-  const targetSet = new Set(computeNewRows(rows, before));
-
-  // フォールバック: 差分が取れない場合は videoID / URL / タイトル一致で判定。
-  if (targetSet.size === 0) {
-    for (const r of rows) {
-      const t = normalize(r.title);
-      if (
-        (videoId && r.text.includes(videoId.toLowerCase())) ||
-        (url && r.text.includes(url)) ||
-        (titleHint && titleHint.length > 8 && (t === titleHint || r.text.includes(titleHint)))
-      ) {
-        targetSet.add(r);
-      }
-    }
-  }
-
+  const targetSet = identifyTargetRows(rows, video);
   const isTarget = (r) => targetSet.has(r);
   const targets = rows.filter(isTarget);
-  await debug("select:rows", { before, rows: rows.map((r) => ({ title: r.title, isTarget: isTarget(r) })) });
+  await debug("select:rows", { before: currentContext.sourceTitlesBefore || [], rows: rows.map((r) => ({ title: r.title, isTarget: isTarget(r) })) });
   if (targets.length === 0) {
     status("追加した動画のソースを特定できなかったため、全ソースが対象のままになります");
-    await debug("select:target-not-found", { videoId, titleHint, before, rows: rows.map((r) => r.title) });
+    await debug("select:target-not-found", { before: currentContext.sourceTitlesBefore || [], rows: rows.map((r) => r.title) });
     return;
   }
 
@@ -808,18 +845,8 @@ async function selectOnlyVideoSource(video) {
   await debug("select:clear-all", { cleared });
   if (cleared) status("いったん全ソースの選択を解除しました");
 
-  // チェックボックスはホバーで出現するため、各行をホバーしてからチェック状態を調整する。
-  // 一括解除できていれば対象をONにするだけ、できていなければここで対象ON・他OFFを行う。
-  let adjusted = 0;
-  const report = [];
-  for (const row of rows) {
-    const want = isTarget(row);
-    const result = await setRowSelected(row, want);
-    report.push({ title: row.title, want, ...result });
-    if (result.status === "toggled") adjusted += 1;
-  }
-
-  await debug("select:done", { targets: targets.map((t) => t.title), adjusted, report });
+  const report = await applyOnlyTargets(rows, isTarget);
+  await debug("select:done", { targets: targets.map((t) => t.title), report });
   if (report.every((r) => r.status === "no-checkbox")) {
     status("ソースの選択チェックボックスを検出できませんでした。全ソースが対象のまま生成される可能性があります。", "info");
   } else if (report.some((r) => r.status === "failed")) {
@@ -827,6 +854,57 @@ async function selectOnlyVideoSource(video) {
   } else {
     status(`マインドマップ対象を「${targets[0].title || "追加した動画"}」のみに設定しました`);
   }
+}
+
+// 現在のソース行から「今回追加した動画」に該当する行の集合を返す。
+function identifyTargetRows(rows, video) {
+  const before = currentContext.sourceTitlesBefore || [];
+
+  // 対象 = 追加前の在庫を超えて増えた行（＝今回新規に追加された動画）。
+  // 多重集合の差分で判定するため、同名の動画が既に存在していても新規分だけを正しく選べる。
+  // 注意: before が空（再利用パスや再選択時）だと computeNewRows は全行を「新規」と返して
+  // しまうため、その場合は差分判定をスキップして下のタイトル/ID一致だけで対象を絞る。
+  const targetSet = before.length > 0 ? new Set(computeNewRows(rows, before)) : new Set();
+  if (targetSet.size > 0) return targetSet;
+
+  // フォールバック: 差分が取れない場合は videoID / URL / タイトル一致で判定。
+  const videoId = safeVideoId(video.url);
+  const titleHint = normalize((video.title || "").slice(0, 24));
+  const url = normalize(video.url);
+  for (const r of rows) {
+    const t = normalize(r.title);
+    if (
+      (videoId && r.text.includes(videoId.toLowerCase())) ||
+      (url && r.text.includes(url)) ||
+      (titleHint && titleHint.length > 8 && (t === titleHint || r.text.includes(titleHint)))
+    ) {
+      targetSet.add(r);
+    }
+  }
+  return targetSet;
+}
+
+// 対象のみON・他はOFFになるよう各行のチェック状態を調整する。
+async function applyOnlyTargets(rows, isTarget) {
+  // チェックボックスはホバーで出現するため、各行をホバーしてからチェック状態を調整する。
+  const report = [];
+  for (const row of rows) {
+    const result = await setRowSelected(row, isTarget(row));
+    report.push({ title: row.title, want: isTarget(row), ...result });
+  }
+  return report;
+}
+
+// 「対象のみ選択」を貼り直す（モデル未反映/再描画でのリセット対策。明示的 change 発火で登録を促す）。
+async function reassertTargetSelection(video) {
+  const panel = findSourcePanel();
+  if (!panel) return;
+  const rows = findSourceRows(panel);
+  if (rows.length === 0) return;
+  const targetSet = identifyTargetRows(rows, video);
+  if (targetSet.size === 0) return;
+  await applyOnlyTargets(rows, (r) => targetSet.has(r));
+  await debug("select:reassert", { targets: [...targetSet].map((t) => t.title) });
 }
 
 // ソースパネル内の各ソース行を取得する。
@@ -856,32 +934,62 @@ function findSourceRows(panel) {
 // 「すべて選択」チェックボックスを使って、全ソースの選択を一括解除する。
 // 見つからない／効かない場合は false を返し、呼び出し側が個別トグルでフォールバックする。
 async function clearAllSelectionsViaMaster() {
-  const master = findSelectAllCheckbox();
-  if (!master) {
+  if (!findSelectAllCheckbox()) {
     await debug("select:no-master");
     return false;
   }
 
-  const needClear = () => {
-    if (master.input) return master.input.checked || master.input.indeterminate;
-    const aria = master.container?.getAttribute("aria-checked");
-    if (aria != null) return aria === "true" || aria === "mixed";
-    return /mdc-checkbox--selected|checked|selected|indeterminate/.test(master.container?.className || "");
-  };
+  // 一括解除を確実に行う：初期状態（全選択／一部選択／未選択）に依らず、
+  // まず「すべて選択（checked）」へ確実に倒してから、「すべて解除（unchecked）」へ倒す。
+  //  - checked（全選択）       → そのまま解除へ（1クリック）
+  //  - indeterminate（一部選択）→ いったん全選択してから解除（2クリック）
+  //  - unchecked（未選択）      → いったん全選択してから解除（2クリック）
+  // インデターミネートからのクリックは「全選択」に倒れるため、解除前に必ず checked を経由させる。
+  await driveMasterTo("checked", 4);
+  await debug("select:master-all-on", { state: masterCheckState(findSelectAllCheckbox()) });
+  await driveMasterTo("unchecked", 4);
 
-  // チェック/部分チェックなら、クリックして全解除（最大3回）。
-  for (let i = 0; i < 3 && needClear(); i += 1) {
-    if (master.input && typeof master.input.click === "function") {
-      master.input.focus?.();
-      master.input.click();
-    } else if (master.container) {
-      await clickElement(master.container);
+  const cleared = masterCheckState(findSelectAllCheckbox()) === "unchecked";
+  await debug("select:master-after", { cleared, state: masterCheckState(findSelectAllCheckbox()) });
+  return cleared;
+}
+
+// 「すべて選択」チェックボックスを、目的の状態（"checked" / "unchecked"）へクリックで倒す。
+async function driveMasterTo(target, maxClicks) {
+  for (let i = 0; i < maxClicks && masterCheckState(findSelectAllCheckbox()) !== target; i += 1) {
+    const m = findSelectAllCheckbox();
+    if (!m) return;
+    if (m.input) {
+      m.input.focus?.();
+      // 表示要素クリックを主手段にしてモデルを確実に更新（未達時のみネイティブclick）。
+      const wasState = masterCheckState(m);
+      clickCheckboxElement(m.input);
+      if (masterCheckState(findSelectAllCheckbox()) === wasState && typeof m.input.click === "function") {
+        m.input.click();
+      }
+      fireSelectionChange(m.input);
+    } else if (m.container) {
+      await clickElement(m.container);
     }
     await wait(450);
   }
+}
 
-  await debug("select:master-after", { stillSelected: needClear(), master: summary(master.container || master.input) });
-  return !needClear();
+// 「すべて選択」チェックボックスの状態を返す（"checked" / "indeterminate" / "unchecked" / "unknown"）。
+function masterCheckState(master) {
+  if (!master) return "unknown";
+  if (master.input) {
+    if (master.input.indeterminate) return "indeterminate";
+    return master.input.checked ? "checked" : "unchecked";
+  }
+  const aria = master.container?.getAttribute("aria-checked");
+  if (aria === "mixed") return "indeterminate";
+  if (aria === "true") return "checked";
+  if (aria === "false") return "unchecked";
+  const cls = master.container?.className || "";
+  if (/indeterminate/.test(cls)) return "indeterminate";
+  if (/mdc-checkbox--selected|checked|selected/.test(cls)) return "checked";
+  return "unchecked";
 }
 
 // 「すべて選択」(Select all) のチェックボックスを探す。
@@ -938,25 +1046,60 @@ async function setRowSelected(item, want) {
   }
 
   const before = input.checked;
-  if (before === want) return { status: "unchanged", was: before };
+  if (before === want) {
+    // 既に望む状態でも、内部モデルへの登録を促すため change を再発火する。
+    // （DOM上はチェック済みでもNotebookLM側の選択モデルに反映されない環境への対策）
+    fireSelectionChange(input);
+    return { status: "unchanged", was: before };
+  }
 
-  // 最大4回まで input をネイティブクリックして切り替える（毎回ホバーを再発火して維持）。
+  // 最大4回まで切り替える（毎回ホバーを再発火して維持）。
+  // 表示要素（タッチターゲット）クリックを主手段にして内部モデルを確実に更新する。
+  // それでも切り替わらない場合のみネイティブ input.click() にフォールバックする。
   for (let attempt = 0; attempt < 4 && input.checked !== want; attempt += 1) {
     hoverRow(item);
     await wait(60);
     input.focus?.();
-    input.click();
-    // クリック対象が反映されない実装に備え、ラベル/コンテナのクリックも併用
-    const label = input.closest("label") || input.closest(".mdc-checkbox, mat-checkbox, .select-checkbox-container");
-    if (label && input.checked !== want) {
-      label.click?.();
-    }
+    clickCheckboxElement(input);
+    if (input.checked !== want) input.click(); // フォールバック（二重トグル回避のため未達時のみ）
     await wait(300);
   }
+
+  // 念のため明示的にも発火する（(change) 連動の実装に対する保険）。
+  fireSelectionChange(input);
 
   const now = input.checked;
   await debug("select:toggle", { title: item.title, want, before, now, input: summary(input) });
   return { status: now === want ? "toggled" : "failed", was: before, now };
+}
+
+// チェックボックスの input/change を明示的に発火し、フレームワークの選択モデル更新を促す。
+function fireSelectionChange(input) {
+  if (!input) return;
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+// 表示されているチェックボックス（mat-checkbox のタッチターゲット）を、実際のユーザー操作に
+// 近いフルのマウスイベント列でクリックする。隠れたネイティブ input の .click() だけでは
+// NotebookLM 内部の選択モデルが更新されない環境があるため、表示要素側をクリックして
+// フレームワークの (click)/(change) ハンドラを確実に起動させる。1回のクリックでトグルする。
+function clickCheckboxElement(input) {
+  if (!input) return;
+  const mdc = input.closest(".mdc-checkbox") || input.parentElement;
+  const matcb = input.closest("mat-checkbox") || mdc;
+  const target =
+    (matcb && matcb.querySelector(".mat-mdc-checkbox-touch-target")) || mdc || input;
+  const r = target.getBoundingClientRect();
+  const o = {
+    bubbles: true, cancelable: true, composed: true, view: window,
+    clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, button: 0
+  };
+  target.dispatchEvent(new PointerEvent("pointerdown", o));
+  target.dispatchEvent(new MouseEvent("mousedown", o));
+  target.dispatchEvent(new PointerEvent("pointerup", o));
+  target.dispatchEvent(new MouseEvent("mouseup", o));
+  target.dispatchEvent(new MouseEvent("click", o));
 }
 
 // ホバーで出現するチェックボックスの input を、出現するまでポーリングして取得する。
@@ -1023,6 +1166,14 @@ async function startMindMap(video) {
     card = findMindMapControl();
   }
 
+  // 既にこの動画に対応するマインドマップがあれば、生成を省略する。
+  const existingMap = findExistingMindMapForVideo(video);
+  if (existingMap) {
+    await debug("mindmap:already-exists", { text: existingMap.text.slice(0, 100) });
+    status("この動画のマインドマップは既に作成済みのため、生成を省略しました", "done");
+    return { skipped: true };
+  }
+
   if (!card) {
     card = await waitFor(
       () => findMindMapControl(),
@@ -1034,6 +1185,11 @@ async function startMindMap(video) {
       throw new Error(error.message);
     });
   }
+
+  // マインドマップのタイルがグレーアウト（disabled-tile）なら、選択中ソースの処理が
+  // まだ完了していない。タイルが有効になるまで待ってからクリックする。クリックしても
+  // 何も起きないため、ここで待たないと「生成完了待ち」で延々とタイムアウトしてしまう。
+  card = await waitForMindMapTileEnabled(card, video);
 
   // 生成前のマインドマップ・アーティファクト件数を記録しておく（完了検出に使う）。
   currentContext.mindMapCountBefore = findMindMapArtifactRows().length;
@@ -1066,6 +1222,54 @@ async function startMindMap(video) {
 
   // 生成完了後に、マインドマップの名前を動画名に変更する（可能な範囲で）。
   await renameArtifactToTitle(video);
+}
+
+// マインドマップ（Studio）のタイルが有効になるまで待つ。
+// NotebookLM は「選択中ソースに処理済みのものが1件以上ある」ときだけ Studio を有効化する。
+// タイルが無効な原因は2通り：(1) 追加直後でソースの処理（インデックス）が未完了、
+// (2) プログラム選択がNotebookLM内部の選択モデルに反映されていない（DOM上はチェック済みでも
+// モデルが0選択のまま）。どちらの場合も、タイルが有効になるまでの間は対象選択を周期的に
+// 貼り直す（明示的に change を再発火して登録を促す）。(1) の場合は無害で、処理が終われば有効化する。
+async function waitForMindMapTileEnabled(card, video) {
+  if (card && !isTileDisabled(card)) return card;
+
+  await debug("mindmap:tile-disabled", { card: card ? summary(card) : null });
+  status("マインドマップを有効化しています（ソースの処理完了・選択反映を待っています）…");
+
+  const start = Date.now();
+  // 背景(background.js)の NLM_RUN_FLOW 応答待ちが 240 秒なので、それより手前で打ち切り、
+  // 「応答なし」と本エラーの二重表示を避ける。
+  const timeout = 180000; // 最大3分。
+  // 選択のモデル未反映対策の貼り直しは「登録を促す」目的なので、最初の数回だけ行えば十分。
+  // それ以降タイルが無効なら原因は処理未完了なので、無駄な再選択スパムはやめて待つだけにする。
+  let lastReassert = 0;
+  let reassertCount = 0;
+  const MAX_REASSERT = 3;
+
+  const enabled = await waitFor(() => {
+    const c = findMindMapControl();
+    if (c && !isTileDisabled(c)) return c;
+    // タイルが無効な最初の数回だけ、対象のみ選択を貼り直してモデル登録を促す。
+    if (reassertCount < MAX_REASSERT && Date.now() - lastReassert > 5000) {
+      lastReassert = Date.now();
+      reassertCount += 1;
+      reassertTargetSelection(video).catch(() => {});
+    }
+    return false;
+  }, timeout, "").catch(() => null);
+
+  if (!enabled) {
+    await snapshot("mind-map-tile-disabled");
+    await debug("mindmap:tile-disabled-timeout", { waitedMs: Date.now() - start });
+    throw new Error(
+      "マインドマップ（Studio）がグレーアウトしたままでした。追加した動画ソースの処理（インデックス）が" +
+      "まだ完了していない可能性があります。NotebookLM画面でソースの読み込み中表示が消えたのを確認してから、" +
+      "もう一度このボタンを実行してください（既存ソースを再利用してすぐにマインドマップを作成します）。" +
+      "字幕／文字起こしを取得できない動画では作成できない場合があります。"
+    );
+  }
+  status("ソースの処理が完了し、マインドマップが有効になりました。生成を開始します");
+  return enabled;
 }
 
 const JP_PROMPT = "出力は必ず日本語で作成してください。各ノードの見出しも日本語にしてください。";
@@ -1303,6 +1507,43 @@ function findMindMapArtifactRows() {
 // 最新（最上段）のマインドマップ行。
 function findNewestMindMapArtifact() {
   return findMindMapArtifactRows()[0] || null;
+}
+
+// 既にこの動画に対応するマインドマップ（アーティファクト）が生成済みなら、その行を返す。
+// 拡張は生成後にマインドマップ名を動画タイトルへ変更するため、種別（マインドマップ）かつ
+// タイトル一致で判定する。種別はアイコン名 flowchart／文言「マインドマップ」で見分ける。
+function findExistingMindMapForVideo(video) {
+  const title = normalize(video.title || "");
+  if (title.length < 8) return null;
+
+  const moreButtons = [...document.querySelectorAll(".artifact-more-button, [class*='artifact-more']")]
+    .filter((el) => isVisible(el));
+
+  for (const moreBtn of moreButtons) {
+    // アイコン＋タイトル＋メタ情報を含む行コンテナまで遡る。
+    let row = moreBtn;
+    for (let i = 0; i < 6 && row; i += 1) {
+      row = row.parentElement;
+      if (row && /artifact-button-content|artifact-stretched|artifact-item|artifact-row/.test(row.className || "")) break;
+    }
+    if (!row) continue;
+
+    const text = normalize(row.textContent);
+    const isMindMap = text.includes("flowchart") || /マインドマップ|mind ?map/.test(text);
+    if (!isMindMap) continue;
+    if (mindMapTextMatchesTitle(text, title)) {
+      return { row, moreBtn, text: cleanText(row.textContent) };
+    }
+  }
+  return null;
+}
+
+// アーティファクト行のテキストが、対象動画のタイトルに一致するか（短縮表示に備え前方一致も許容）。
+function mindMapTextMatchesTitle(text, title) {
+  if (!title || title.length < 8) return false;
+  if (text.includes(title)) return true;
+  const prefix = title.slice(0, 20);
+  return prefix.length >= 10 && text.includes(prefix);
 }
 
 // マインドマップの生成完了を、Studio一覧への新規アーティファクト出現で検出する。
@@ -1665,6 +1906,16 @@ function isDisabled(element) {
     element.disabled ||
       element.getAttribute("aria-disabled") === "true" ||
       element.closest("[disabled], [aria-disabled='true']")
+  );
+}
+
+// Studioのカード（マインドマップ等）がグレーアウトしているか。
+// NotebookLMは標準の disabled 属性ではなく `disabled-tile` クラスで無効を表すため、
+// isDisabled() とは別に判定する必要がある（ソース処理が未完了だと無効になる）。
+function isTileDisabled(element) {
+  if (!element) return true;
+  return Boolean(
+    element.closest(".disabled-tile, [class*='disabled-tile']") || isDisabled(element)
   );
 }
 
